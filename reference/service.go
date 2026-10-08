@@ -330,5 +330,5 @@ func (s *Service) Notification(ctx context.Context, owner tasks.Owner, id string
 	if err != nil {
 		return tasks.TaskStatusNotification{}, err
 	}
-	return tasks.TaskStatusNotification{JSONRPC: "2.0", Method: tasks.MethodNotification, Params: result.DetailedTask}, nil
+	return tasks.TaskStatusNotification{JSONRPC: "2.0", Method: tasks.MethodNotification, Params: tasks.TaskNotificationParams{DetailedTask: result.DetailedTask}}, nil
 }

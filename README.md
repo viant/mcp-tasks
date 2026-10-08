@@ -7,7 +7,7 @@ Go support for the official [`io.modelcontextprotocol/tasks` extension, 2026-07-
 This module targets the dated specification, not the draft or the incompatible
 2025-11-25 Tasks API. Core MCP schemas remain in `mcp-protocol`; transports remain
 in `viant/mcp`. This module supplies extension types, policy/state interfaces,
-a reference durable store, an opt-in RPC decorator, and a polling client.
+a reference durable store, an opt-in RPC decorator, and polling/streaming clients.
 
 ## Quick start
 
@@ -89,6 +89,9 @@ The server decides whether to create a task for each tool request. The client
 must declare the extension in that request's `_meta` capabilities; declarations
 on another request or an older initialization do not authorize this response.
 Calls that do not use task augmentation keep their existing result and behavior.
+`CreateTaskResult` carries a flat `Task` seed, which can already have any status.
+Status-specific result/error/input payloads are fetched as `DetailedTask` through
+`tasks/get` or full-state notifications; seed decoding does not require them.
 The creator commits the owned record and verifies that it can be read before
 exposing its handle. Hosts that create work through the reference backend must
 schedule it only after this durable barrier; adapters may instead capture an
@@ -124,8 +127,8 @@ Cancellation records intent; its acknowledgement does not prove work stopped.
 | `working`, `input_required` | Progress and all outstanding requests |
 | `completed` | Original result, including tool-level `isError: true` |
 | `failed` | JSON-RPC error only |
-| `notifications/tasks` | Typed full-state notification and ownership helpers; stream wiring remains host-owned |
-| `subscriptions/listen` task filters | Missing-capability validation; actual task subscriptions explicitly unsupported by the basic decorator |
+| `notifications/tasks` | Full owned canonical state on an acknowledged subscription stream |
+| `subscriptions/listen` task filters | Explicit bounded task IDs, acknowledgement-first ordering, per-owner validation and optional native event hints |
 | HTTP | `Mcp-Method` plus `Mcp-Name: taskId` on get/update/cancel |
 | Legacy API | No `tasks/list`, `tasks/result`, task-preference parameter or legacy task capability claim |
 
@@ -153,13 +156,21 @@ Minimal native `viant/mcp` hooks needed for seamless high-level integration:
 3. Route Tasks requests by `taskId` in the Streamable HTTP `Mcp-Name` header and
    attach July per-request metadata. A raw transport supplied to this module can
    already carry extension requests without changing core schemas.
-4. If notifications are enabled later, add owned `taskIds` filters and full-state
-   notifications to the existing subscription hub. Do not send task progress or
-   logging on that stream.
+4. Tool-schema `x-mcp-header` discovery, validation and argument mirroring belong
+   to the host/high-level MCP client. This raw Tasks client does not fetch/cache
+   all tool schemas or claim that complete core client surface. A custom caller
+   can provide those headers without replaying a call.
+5. The supplied decorator already streams owned `taskIds` through its actual
+   configured notifier. A native `viant/mcp` integration may compose this with
+   its existing subscription hub. Mixed Tasks/base filters are rejected by the
+   standalone decorator instead of silently dropping them.
 
 For Agently, adapt these hooks to existing runs, deferred inputs, approvals,
 resume/cancel APIs and AG-UI projections; do not create another native task engine.
 Keep native causal links in the adapter's private record, not caller-supplied IDs.
+Existing async tool pairs (run/status/cancel), operation selectors, wait/detach
+and skill fork remain the native APIs and execution modes. MCP Tasks adapts
+them for interoperable clients; it does not deprecate or replace them.
 
 | Existing execution mode | Required adapter behavior / acceptance |
 | --- | --- |
@@ -182,6 +193,76 @@ policy and owner resolver; importing this module does not automatically enable
 an endpoint or authorize arbitrary tools. No runtime/UI deployment is performed
 by this module.
 
+## Task subscription streams
+
+Configure the actual notification transport before accepting `taskIds`:
+
+```go
+handler := &rpc.Handler{
+    Next: ordinaryMCPHandler,
+    Service: nativeBackend,
+    Owner: resolveAuthenticatedOwner,
+    Notifier: requestScopedNotifier,
+    Subscriptions: &rpc.SubscriptionOptions{
+        ReconcileInterval: time.Second,
+        MaxDuration: 5 * time.Minute,
+    },
+}
+```
+
+`rpc.HTTPHandler` supplies a request-scoped SSE notifier from a `Build` factory.
+Host middleware must prepare authentication/context before its owner resolver.
+The adapter rejects present Origins unless `AllowOrigin` explicitly admits them.
+It validates July routing headers before admission, decodes the standard
+Base64 sentinel for `Mcp-Name`, and returns HTTP 400/404 with correlated protocol
+errors. Callers preserve those error bodies; they do not interpret them as
+permission to retry a mutation or fall back to an unauthenticated transport.
+`protocolVersion` and `clientCapabilities` are required per request; `clientInfo`
+is optional. Authentication never derives from self-reported client metadata.
+Other transports can provide their existing `transport.Notifier`; stdio
+`notifications/cancelled` ends only the matching owned subscription. The HTTP client generates positive integer stream IDs; servers also accept
+valid MCP string/integer IDs. These IDs are present in every acknowledgement,
+notification and graceful result under
+`_meta["io.modelcontextprotocol/subscriptionId"]`.
+
+A backend may implement `tasks.ChangeSource` for bounded wakeup hints from its
+existing native event bus. The stream attaches hints before reading state, then
+re-reads `Backend.Get` after hints and periodically. Hints never carry MCP
+payloads. Dropped/overflowed events and process-local bus loss are recovered by
+canonical rereads; reconnect creates a fresh subscription and initial full-state
+snapshot. There is no execution replay or unbounded durable event backfill.
+
+The typed client supports bounded HTTP observation and reconnect:
+
+```go
+err := requester.Subscribe(ctx, []string{taskID}, client.SubscriptionOptions{
+    MaxReconnects: 3,
+    OnTask: func(state tasks.DetailedTask) error {
+        renderOwnedTaskState(state)
+        return nil
+    },
+})
+```
+
+`Subscribe` verifies acknowledgement order, agreed IDs, subscription correlation,
+state shape (including required `ttlMs`) and declared input capabilities. It only observes: input responses
+and task cancellation still require their explicit APIs and ordinary policy.
+Unexpected disconnects refresh canonical state and reconnect within the supplied
+budget; protocol errors and callback failures are not retried. Cancelling `ctx`
+closes the observer and leaves the task running.
+
+Frames, selected IDs, per-handler active subscriptions, stream duration and
+reconnect count are bounded. Hosts own aggregate connection quotas when their
+factory creates a handler per request. Frame bytes are bounded independently of stream lifetime. Slow
+HTTP writes have a deadline; request cancellation cleans up event subscriptions.
+Mixed task/base filters, unrequested notification methods, unknown/foreign task
+IDs, missing Tasks capability, and input notifications without the corresponding
+client capabilities are rejected. No task list or cross-owner stream exists.
+
+The [dated core subscription contract](https://github.com/modelcontextprotocol/modelcontextprotocol/blob/main/docs/specification/2026-07-28/basic/patterns/subscriptions.mdx)
+and [dated Tasks extension](https://tasks.extensions.modelcontextprotocol.io/specification/2026-07-28/tasks)
+define these wire rules. Draft behavior is not enabled.
+
 ## Testing and status
 
 ```sh
@@ -195,12 +276,19 @@ negotiation, missing capability error `-32021`, owner/tenant isolation, atomic
 cross-instance storage, durable reopen, partial/deduplicated input, unique keys,
 TTL, tool versus protocol errors, cooperative cancellation and competing
 terminal transitions. Integration tests use the real `viant/mcp` handler and
-ordinary high-level client, a task-aware raw client, and HTTP routing headers.
+ordinary high-level client, a task-aware raw client, and HTTP routing headers. Streaming tests cover real HTTP acknowledgement and
+full states, bounded reconnect with canonical refresh, stdio observer
+cancellation, owner/tenant rejection, input-capability checks after acknowledgement,
+malformed or unrequested frames, and frame budgets independent of stream lifetime.
 No live service, application account, credentials or UI is required.
 
 The dated Tasks request/poll/update/cancel contract is implemented and tested.
-Optional server subscription streaming is not implemented: the decorator rejects
-it explicitly and exposes only typed full-state notifications for host adapters.
+Task subscription streaming is implemented behind explicit transport enablement.
+The decorator rejects subscription requests unless both `Subscriptions` options
+and a real `Notifier` are configured. It emits acknowledgement first, full state
+only, and a correlated graceful completion; it never forwards task progress or
+logging events. Mixed task/base subscriptions require host composition and are
+rejected explicitly by this standalone adapter.
 The older 2025-11-25 API is deliberately separate. Production store retention,
 quotas, process shutdown, request authentication, native scheduling and recovery
 are host responsibilities. Tests do not certify an application's deployment.

@@ -113,6 +113,9 @@ func (c *HTTPCaller) Call(ctx context.Context, request Request) (json.RawMessage
 			return nil, err
 		}
 		req.Header = headers.Clone()
+		if req.Header == nil {
+			req.Header = make(http.Header)
+		}
 	}
 	for key, values := range request.Headers {
 		req.Header[key] = append([]string(nil), values...)
@@ -126,7 +129,7 @@ func (c *HTTPCaller) Call(ctx context.Context, request Request) (json.RawMessage
 		if json.Unmarshal(request.Params, &params) != nil || !tasks.ValidID(params.TaskID) {
 			return nil, errors.New("invalid task routing identity")
 		}
-		req.Header.Set("Mcp-Name", params.TaskID)
+		req.Header.Set("Mcp-Name", EncodeHeaderValue(params.TaskID))
 	}
 	if request.Method == tasks.MethodCallTool {
 		var named struct {
@@ -135,7 +138,7 @@ func (c *HTTPCaller) Call(ctx context.Context, request Request) (json.RawMessage
 		if json.Unmarshal(request.Params, &named) != nil || !tasks.ValidID(named.Name) {
 			return nil, errors.New("invalid tool routing identity")
 		}
-		req.Header.Set("Mcp-Name", named.Name)
+		req.Header.Set("Mcp-Name", EncodeHeaderValue(named.Name))
 	}
 	response, err := c.client.Do(req)
 	if err != nil {
@@ -143,6 +146,10 @@ func (c *HTTPCaller) Call(ctx context.Context, request Request) (json.RawMessage
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
+		if response.StatusCode == http.StatusBadRequest || response.StatusCode == http.StatusNotFound {
+			idJSON, _ := json.Marshal(id)
+			return nil, readHTTPRPCError(response, idJSON)
+		}
 		return nil, fmt.Errorf("MCP HTTP status %d", response.StatusCode)
 	}
 	if strings.HasPrefix(response.Header.Get("Content-Type"), "text/event-stream") {

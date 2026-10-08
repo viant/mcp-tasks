@@ -80,9 +80,20 @@ type DetailedTask struct {
 }
 type CreateTaskResult struct {
 	ResultType string `json:"resultType"`
+	// DetailedTask remains embedded for source compatibility. Creation carries
+	// only the Task seed on the wire; status-specific payloads come from Get.
 	DetailedTask
 	Meta map[string]json.RawMessage `json:"_meta,omitempty"`
 }
+
+func (r CreateTaskResult) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		ResultType string `json:"resultType"`
+		Task
+		Meta map[string]json.RawMessage `json:"_meta,omitempty"`
+	}{r.ResultType, r.Task, r.Meta})
+}
+
 type GetTaskResult struct {
 	ResultType string `json:"resultType"`
 	DetailedTask
@@ -103,9 +114,9 @@ type UpdateParams struct {
 	Meta           map[string]json.RawMessage `json:"_meta,omitempty"`
 }
 type TaskStatusNotification struct {
-	JSONRPC string       `json:"jsonrpc"`
-	Method  string       `json:"method"`
-	Params  DetailedTask `json:"params"`
+	JSONRPC string                 `json:"jsonrpc"`
+	Method  string                 `json:"method"`
+	Params  TaskNotificationParams `json:"params"`
 }
 
 func ValidID(id string) bool {
@@ -223,17 +234,54 @@ func DecodeCreate(raw json.RawMessage) (CreateTaskResult, error) {
 	if result.ResultType != ResultTask {
 		return result, errors.New("task creation requires resultType task")
 	}
-	return result, result.DetailedTask.Validate()
+	if err := result.Task.Validate(); err != nil {
+		return result, err
+	}
+	// The standard seed may be in any status without the DetailedTask payload.
+	// If a peer adds such payloads, still reject contradictory or malformed data.
+	if len(result.InputRequests) > 0 || len(result.Result) > 0 || result.Error != nil {
+		return result, result.DetailedTask.Validate()
+	}
+	return result, nil
 }
 func decodeTask(raw json.RawMessage, result any) error {
+	return decodeTaskFields(raw, result, true)
+}
+
+// DecodeNotificationParams validates the same required Task fields as Get.
+// In particular a missing ttlMs must not silently become unlimited retention.
+func DecodeNotificationParams(raw json.RawMessage) (TaskNotificationParams, error) {
+	var result TaskNotificationParams
+	if err := decodeTaskFields(raw, &result, false); err != nil {
+		return result, err
+	}
+	return result, result.DetailedTask.Validate()
+}
+
+func decodeTaskFields(raw json.RawMessage, result any, resultType bool) error {
 	if !ValidObject(raw) {
 		return errors.New("invalid task JSON object")
 	}
 	var fields map[string]json.RawMessage
 	_ = json.Unmarshal(raw, &fields)
-	for _, key := range []string{"resultType", "taskId", "status", "createdAt", "lastUpdatedAt", "ttlMs"} {
+	keys := []string{"taskId", "status", "createdAt", "lastUpdatedAt", "ttlMs"}
+	if resultType {
+		keys = append(keys, "resultType")
+	}
+	for _, key := range keys {
 		if _, ok := fields[key]; !ok {
 			return fmt.Errorf("missing task field %s", key)
+		}
+	}
+	for _, key := range []string{"statusMessage", "pollIntervalMs"} {
+		if value, exists := fields[key]; exists && bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			return fmt.Errorf("task field %s cannot be null", key)
+		}
+	}
+	if rawError, exists := fields["error"]; exists && !bytes.Equal(bytes.TrimSpace(rawError), []byte("null")) {
+		var failure map[string]json.RawMessage
+		if json.Unmarshal(rawError, &failure) != nil || failure == nil || len(failure["code"]) == 0 || bytes.Equal(bytes.TrimSpace(failure["code"]), []byte("null")) || len(failure["message"]) == 0 {
+			return errors.New("failed task requires a complete JSON-RPC error object")
 		}
 	}
 	return json.Unmarshal(raw, result)

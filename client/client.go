@@ -100,13 +100,13 @@ func (c *Client) call(ctx context.Context, method, id string, input any) (json.R
 	}
 	headers := http.Header{"Mcp-Method": []string{method}, "Mcp-Protocol-Version": []string{tasks.ProtocolVersion}}
 	if id != "" {
-		headers.Set("Mcp-Name", id)
+		headers.Set("Mcp-Name", rpc.EncodeHeaderValue(id))
 	} else if method == tasks.MethodCallTool {
 		var named struct {
 			Name string `json:"name"`
 		}
 		_ = json.Unmarshal(params, &named)
-		headers.Set("Mcp-Name", named.Name)
+		headers.Set("Mcp-Name", rpc.EncodeHeaderValue(named.Name))
 	}
 	result, err := c.caller.Call(ctx, rpc.Request{Method: method, Params: params, Headers: headers})
 	if err != nil {
@@ -154,6 +154,9 @@ func (c *Client) CallTool(ctx context.Context, params *schema.CallToolRequestPar
 		return ToolOutcome{}, ErrInvalidPeer
 	}
 	if result.Type != tasks.ResultTask {
+		if result.Type != "" && result.Type != tasks.ResultComplete && result.Type != "input_required" {
+			return ToolOutcome{}, ErrInvalidPeer
+		}
 		return ToolOutcome{Result: raw}, nil
 	}
 	if !c.options.Tasks {

@@ -174,4 +174,10 @@ func TestRejectWrongTaskIdentityChangedInputAndUnnegotiatedHandle(t *testing.T) 
 	if _, err := c.CallTool(context.Background(), &schema.CallToolRequestParams{Name: "fixture"}); !errors.Is(err, client.ErrInvalidPeer) {
 		t.Fatal("unnegotiated handle", err)
 	}
+	c = requester(t, rpc.CallerFunc(func(context.Context, rpc.Request) (json.RawMessage, error) {
+		return json.RawMessage(`{"resultType":"unnegotiated-extension","content":[]}`), nil
+	}), true, nil)
+	if _, err := c.CallTool(context.Background(), &schema.CallToolRequestParams{Name: "fixture"}); !errors.Is(err, client.ErrInvalidPeer) {
+		t.Fatal("unknown result discriminator accepted", err)
+	}
 }

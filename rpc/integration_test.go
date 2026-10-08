@@ -20,6 +20,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 )
 
@@ -28,11 +29,17 @@ type ownerKey struct{}
 var alice = tasks.Owner{Tenant: "fixture", Subject: "alice"}
 
 type loopback struct {
-	handler transport.Handler
-	calls   []string
+	handler  transport.Handler
+	calls    []string
+	sequence atomic.Uint64
 }
 
 func (l *loopback) Send(ctx context.Context, request *jsonrpc.Request) (*jsonrpc.Response, error) {
+	// Real transports allocate missing IDs before dispatch; emulate that wire
+	// boundary rather than admitting a nil-ID high-level client request.
+	if request.Id == nil {
+		request.Id = l.sequence.Add(1)
+	}
 	l.calls = append(l.calls, request.Method)
 	response := &jsonrpc.Response{Jsonrpc: "2.0", Id: request.Id}
 	l.handler.Serve(ctx, request, response)
@@ -205,7 +212,7 @@ func TestHTTPRoutingAndPerRequestNegotiation(t *testing.T) {
 		t.Fatal("cancel intent not durable")
 	}
 	// The next request has no capability despite the earlier negotiated request.
-	params, _ := json.Marshal(map[string]any{"taskId": taskID})
+	params, _ := json.Marshal(map[string]any{"taskId": taskID, "_meta": map[string]any{"io.modelcontextprotocol/protocolVersion": tasks.ProtocolVersion, tasks.ClientCapabilitiesMeta: map[string]any{}}})
 	request := &jsonrpc.Request{Jsonrpc: "2.0", Id: 17, Method: tasks.MethodGet, Params: params}
 	response := &jsonrpc.Response{}
 	handler.Serve(context.WithValue(context.Background(), ownerKey{}, alice), request, response)
@@ -225,7 +232,7 @@ func TestMalformedUpdateAndTaskSubscriptions(t *testing.T) {
 		handler.Serve(ctx, &jsonrpc.Request{Jsonrpc: "2.0", Id: 1, Method: method, Params: raw}, response)
 		return response
 	}
-	noCapability := call("subscriptions/listen", map[string]any{"notifications": map[string]any{"taskIds": []string{"fixture"}}})
+	noCapability := call("subscriptions/listen", map[string]any{"notifications": map[string]any{"taskIds": []string{"fixture"}}, "_meta": map[string]any{"io.modelcontextprotocol/protocolVersion": tasks.ProtocolVersion, tasks.ClientCapabilitiesMeta: map[string]any{}}})
 	if noCapability.Error == nil || noCapability.Error.Code != -32021 {
 		t.Fatal("subscription missing-capability code")
 	}

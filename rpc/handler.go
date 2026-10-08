@@ -13,6 +13,7 @@ import (
 	"github.com/viant/jsonrpc/transport"
 	tasks "github.com/viant/mcp-tasks"
 	"io"
+	"sync"
 )
 
 type OwnerResolver func(context.Context, *jsonrpc.Request) (tasks.Owner, error)
@@ -25,33 +26,47 @@ type Decision struct {
 // through the canonical runtime only after its owned task creation is durable.
 type DecideTool func(context.Context, tasks.Owner, *jsonrpc.Request) (Decision, error)
 type Handler struct {
-	Next    transport.Handler
-	Service tasks.Backend
-	Owner   OwnerResolver
-	Decide  DecideTool
+	Next                transport.Handler
+	Service             tasks.Backend
+	Owner               OwnerResolver
+	Decide              DecideTool
+	Notifier            transport.Notifier
+	Subscriptions       *SubscriptionOptions
+	subscriptionsMu     sync.Mutex
+	activeSubscriptions map[string]activeSubscription
 }
 
 func (h *Handler) Serve(ctx context.Context, request *jsonrpc.Request, response *jsonrpc.Response) {
 	if request == nil || response == nil {
 		return
 	}
-	if request.Jsonrpc != jsonrpc.Version {
+	if request.Jsonrpc != jsonrpc.Version || !ValidRequestID(request.Id) {
 		response.Error = jsonrpc.NewInvalidRequest("invalid JSON-RPC version", nil)
 		return
 	}
 	taskMethod := request.Method == tasks.MethodGet || request.Method == tasks.MethodUpdate || request.Method == tasks.MethodCancel
+	var metadata struct {
+		Meta map[string]json.RawMessage `json:"_meta"`
+	}
+	_ = json.Unmarshal(request.Params, &metadata)
+	var version string
+	_ = json.Unmarshal(metadata.Meta["io.modelcontextprotocol/protocolVersion"], &version)
+	if version == tasks.ProtocolVersion && !ValidRequestMetadata(request.Params) {
+		response.Error = jsonrpc.NewInvalidParamsError("required per-request metadata missing or malformed", nil)
+		return
+	}
 	caps, err := tasks.RequestCapabilities(request.Params)
 	if err != nil && (taskMethod || request.Method == tasks.MethodCallTool) {
 		response.Error = jsonrpc.NewInvalidParamsError("invalid request capabilities", nil)
 		return
 	}
 	if taskMethod {
-		if !tasks.Supports(caps) {
-			response.Error = asRPC(tasks.MissingCapability())
+		if !ValidRequestMetadata(request.Params) {
+			response.Error = jsonrpc.NewInvalidParamsError("July per-request metadata required", nil)
 			return
 		}
-		if !validJulyMeta(request.Params) {
-			response.Error = jsonrpc.NewInvalidParamsError("July per-request metadata required", nil)
+		if !tasks.Supports(caps) {
+			response.Error = asRPC(tasks.MissingCapability())
 			return
 		}
 		owner, err := h.resolve(ctx, request)
@@ -109,7 +124,7 @@ func (h *Handler) Serve(ctx context.Context, request *jsonrpc.Request, response 
 			return
 		}
 		if decision.Create != nil && tasks.Supports(caps) {
-			if !validJulyMeta(request.Params) {
+			if !ValidRequestMetadata(request.Params) {
 				response.Error = jsonrpc.NewInvalidParamsError("July per-request metadata required", nil)
 				return
 			}
@@ -120,22 +135,30 @@ func (h *Handler) Serve(ctx context.Context, request *jsonrpc.Request, response 
 			return
 		}
 	}
-	if request.Method == "subscriptions/listen" {
-		var params struct {
-			Notifications struct {
-				TaskIDs []string `json:"taskIds"`
-			} `json:"notifications"`
-		}
-		if json.Unmarshal(request.Params, &params) == nil && params.Notifications.TaskIDs != nil {
+	if request.Method == tasks.MethodListen {
+		var probe map[string]json.RawMessage
+		var filter map[string]json.RawMessage
+		_ = json.Unmarshal(request.Params, &probe)
+		_ = json.Unmarshal(probe["notifications"], &filter)
+		if _, present := filter["taskIds"]; present {
+			if !ValidRequestMetadata(request.Params) {
+				response.Error = jsonrpc.NewInvalidParamsError("July per-request metadata required", nil)
+				return
+			}
 			if !tasks.Supports(caps) {
 				response.Error = asRPC(tasks.MissingCapability())
 				return
 			}
-			// No stream owner is installed by this minimal decorator. Never fake an ack.
-			response.Error = jsonrpc.NewMethodNotFound("task subscriptions are not configured", nil)
+			if h.Subscriptions == nil || h.Notifier == nil {
+				response.Error = jsonrpc.NewMethodNotFound("task subscriptions are not configured", nil)
+				return
+			}
+			value, err := h.listen(ctx, request, caps)
+			h.reply(response, value, err)
 			return
 		}
 	}
+
 	if h.Next == nil {
 		response.Error = jsonrpc.NewMethodNotFound("method not configured", nil)
 		return
@@ -171,6 +194,9 @@ func (h *Handler) Serve(ctx context.Context, request *jsonrpc.Request, response 
 	}
 }
 func (h *Handler) OnNotification(ctx context.Context, notification *jsonrpc.Notification) {
+	if h.cancelSubscription(ctx, notification) {
+		return
+	}
 	if h.Next != nil {
 		h.Next.OnNotification(ctx, notification)
 	}
@@ -199,7 +225,11 @@ func decode(raw json.RawMessage, value any) error {
 	}
 	return nil
 }
-func validJulyMeta(params json.RawMessage) bool {
+
+// ValidRequestMetadata checks required protocol/capability metadata. ClientInfo
+// is optional in July core and must never serve as authenticated authority.
+// Host decorators must validate it before admitting task-augmented execution.
+func ValidRequestMetadata(params json.RawMessage) bool {
 	var input struct {
 		Meta map[string]json.RawMessage `json:"_meta"`
 	}
@@ -209,6 +239,15 @@ func validJulyMeta(params json.RawMessage) bool {
 	var version string
 	if json.Unmarshal(input.Meta["io.modelcontextprotocol/protocolVersion"], &version) != nil || version != tasks.ProtocolVersion {
 		return false
+	}
+	if !tasks.ValidObject(input.Meta[tasks.ClientCapabilitiesMeta]) {
+		return false
+	}
+	if _, err := tasks.RequestCapabilities(params); err != nil {
+		return false
+	}
+	if _, present := input.Meta["io.modelcontextprotocol/clientInfo"]; !present {
+		return true
 	}
 	var info struct {
 		Name    string `json:"name"`
